@@ -95,6 +95,13 @@ func NewTextParser(nameValidationScheme model.ValidationScheme) TextParser {
 // proto messages in a map where the metric names are the keys, along with any
 // error encountered.
 //
+// If parsing fails, the error is returned together with a nil map. Callers
+// never see partially parsed metric families from a failed parse, so the only
+// way to get data out of this method is a fully successful parse. A
+// TextParser can be safely reused afterwards, including with the same reader:
+// each call starts from a clean state and never inherits descriptors or
+// errors from a previous parse (see reset).
+//
 // If the input contains duplicate metrics (i.e. lines with the same metric name
 // and exactly the same label set), the resulting MetricFamily will contain
 // duplicate Metric proto messages. Similar is true for duplicate label
@@ -118,12 +125,6 @@ func (p *TextParser) TextToMetricFamilies(in io.Reader) (map[string]*dto.MetricF
 	for nextState := p.startOfLine; nextState != nil; nextState = nextState() {
 		// Magic happens here...
 	}
-	// Get rid of empty metric families.
-	for k, mf := range p.metricFamiliesByName {
-		if len(mf.GetMetric()) == 0 {
-			delete(p.metricFamiliesByName, k)
-		}
-	}
 	// If p.err is io.EOF now, we have run into a premature end of the input
 	// stream. Turn this error into something nicer and more
 	// meaningful. (io.EOF is often used as a signal for the legitimate end
@@ -131,10 +132,22 @@ func (p *TextParser) TextToMetricFamilies(in io.Reader) (map[string]*dto.MetricF
 	if p.err != nil && errors.Is(p.err, io.EOF) {
 		p.parseError("unexpected end of input stream")
 	}
+	if p.err != nil {
+		// Do not expose partially parsed families from a failed parse. The
+		// parser state stays around for a successful retry via reset, but the
+		// incomplete result is discarded.
+		return nil, p.err
+	}
+	// Get rid of empty metric families.
+	for k, mf := range p.metricFamiliesByName {
+		if len(mf.GetMetric()) == 0 {
+			delete(p.metricFamiliesByName, k)
+		}
+	}
 	for _, histogramMetric := range p.histograms {
 		normalizeHistogram(histogramMetric.GetHistogram())
 	}
-	return p.metricFamiliesByName, p.err
+	return p.metricFamiliesByName, nil
 }
 
 // normalizeHistogram makes sure that all the buckets and the count in each
@@ -169,25 +182,40 @@ func normalizeHistogram(histogram *dto.Histogram) {
 	}
 }
 
+// reset prepares the parser for a brand-new parse of in. Every field that
+// carries per-input state is cleared here so that reusing a TextParser across
+// TextToMetricFamilies calls can never inherit a descriptor, metric family,
+// label pair, or error from a previous input. The name validation scheme is
+// configuration rather than parse state and is intentionally preserved.
 func (p *TextParser) reset(in io.Reader) {
 	p.metricFamiliesByName = map[string]*dto.MetricFamily{}
-	p.currentLabelPairs = nil
 	if p.buf == nil {
 		p.buf = bufio.NewReader(in)
 	} else {
+		// Reset also discards any bytes still buffered from the previous
+		// reader, so retrying with the same reader never resumes halfway
+		// through an old input.
 		p.buf.Reset(in)
 	}
 	p.err = nil
 	p.lineCount = 0
-	if p.summaries == nil || len(p.summaries) > 0 {
-		p.summaries = map[uint64]*dto.Metric{}
-	}
-	if p.histograms == nil || len(p.histograms) > 0 {
-		p.histograms = map[uint64]*dto.Metric{}
-	}
+	p.currentByte = 0
+	p.currentToken.Reset()
+	p.currentMF = nil
+	p.currentMetric = nil
+	p.currentLabelPair = nil
+	p.currentLabelPairs = nil
+	p.currentLabels = nil
+	p.summaries = map[uint64]*dto.Metric{}
+	p.histograms = map[uint64]*dto.Metric{}
 	p.currentQuantile = math.NaN()
 	p.currentBucket = math.NaN()
-	p.currentMF = nil
+	p.currentIsSummaryCount = false
+	p.currentIsSummarySum = false
+	p.currentIsHistogramCount = false
+	p.currentIsHistogramSum = false
+	p.currentMetricIsInsideBraces = false
+	p.currentMetricInsideBracesIsPresent = false
 }
 
 // startOfLine represents the state where the next byte read from p.buf is the

@@ -623,6 +623,37 @@ func TestTextDecoderWithBufioReader(t *testing.T) {
 	require.Truef(t, decoded, "Metric foo not decoded")
 }
 
+// TestTextDecoderFailureDoesNotEmitPartialFamilies ensures that a text input
+// with a malformed tail never surfaces the families parsed before the error.
+func TestTextDecoderFailureDoesNotEmitPartialFamilies(t *testing.T) {
+	// The first family is fully valid; the broken sample follows it.
+	in := `# TYPE good gauge
+good 1
+broken not-a-float
+`
+	dec := NewDecoder(strings.NewReader(in), FmtText)
+
+	var first dto.MetricFamily
+	err := dec.Decode(&first)
+	var parseErr ParseError
+	if !errors.As(err, &parseErr) {
+		t.Fatalf("expected a ParseError, got %T: %v", err, err)
+	}
+	if parseErr.Line != 3 {
+		t.Fatalf("expected the error on line 3, got line %d", parseErr.Line)
+	}
+	if first.GetName() != "" {
+		t.Fatalf("decoder emitted partial family %q before the parse error", first.GetName())
+	}
+
+	// The decoder stays latched onto the error instead of recovering into a
+	// success state.
+	var second dto.MetricFamily
+	if err := dec.Decode(&second); err == nil {
+		t.Fatalf("expected the decoder to keep returning the error, got family %q", second.GetName())
+	}
+}
+
 func TestNewDecoder(t *testing.T) {
 	om20RCFormat, err := NewOpenMetricsFormat(OpenMetricsVersion_2_0_0_rc)
 	require.NoError(t, err)

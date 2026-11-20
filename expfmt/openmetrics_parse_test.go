@@ -1178,3 +1178,109 @@ func TestOpenMetricsStreaming(t *testing.T) {
 	require.ErrorIs(t, dec.Decode(&mf3), io.EOF)
 	require.NoError(t, <-errCh)
 }
+
+// TestOpenMetricsParserReuseIsolation verifies that two independent decoders
+// (and therefore two fresh parser states) cannot leak descriptor or family
+// state between inputs, including when the second input reuses family names
+// from the first.
+func TestOpenMetricsParserReuseIsolation(t *testing.T) {
+	format := FmtOpenMetrics_1_0_0.WithEscapingScheme(model.NoEscaping)
+
+	first := `# TYPE first counter
+# HELP first first help
+first_total 1
+# EOF
+`
+	firstOut := decodeAllOpenMetrics(t, first, format)
+	require.Contains(t, firstOut, "first_total")
+
+	second := `# TYPE second gauge
+second 2
+# EOF
+`
+	secondOut := decodeAllOpenMetrics(t, second, format)
+	require.Len(t, secondOut, 1)
+	require.Contains(t, secondOut, "second")
+	require.NotContains(t, secondOut, "first_total")
+	require.Equal(t, dto.MetricType_GAUGE, secondOut["second"].GetType())
+
+	// A same-named family in a new input must not inherit the previous
+	// input's descriptor.
+	shadow := `third 3
+# EOF
+`
+	shadowOut := decodeAllOpenMetrics(t, shadow, format)
+	require.Len(t, shadowOut, 1)
+	require.Equal(t, dto.MetricType_UNTYPED, shadowOut["third"].GetType())
+	require.Empty(t, shadowOut["third"].GetHelp())
+}
+
+// TestOpenMetricsDuplicateDescriptors ensures duplicate descriptors (and type
+// conflicts) are rejected at the exact line of the second descriptor.
+func TestOpenMetricsDuplicateDescriptors(t *testing.T) {
+	format := FmtOpenMetrics_1_0_0.WithEscapingScheme(model.NoEscaping)
+	cases := []struct {
+		name     string
+		input    string
+		wantLine int
+		wantMsg  string
+	}{
+		{
+			name:     "duplicate TYPE with conflicting type",
+			input:    "# TYPE m gauge\n# TYPE m counter\n# EOF\n",
+			wantLine: 2,
+			wantMsg:  `second TYPE line for metric name "m"`,
+		},
+		{
+			name:     "duplicate identical TYPE",
+			input:    "# TYPE m gauge\n# TYPE m gauge\n# EOF\n",
+			wantLine: 2,
+			wantMsg:  `second TYPE line for metric name "m"`,
+		},
+		{
+			name:     "duplicate HELP",
+			input:    "# HELP m first\n# HELP m second\n# EOF\n",
+			wantLine: 2,
+			wantMsg:  `second HELP line for metric name "m"`,
+		},
+		{
+			name:     "descriptor after samples",
+			input:    "# TYPE m gauge\nm 1\n# TYPE m counter\n# EOF\n",
+			wantLine: 3,
+			wantMsg:  `metadata for metric "m" after samples`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := decodeOpenMetricsErr(tc.input, format)
+			var parseErr ParseError
+			require.ErrorAs(t, err, &parseErr)
+			require.Equal(t, tc.wantLine, parseErr.Line)
+			require.Contains(t, parseErr.Msg, tc.wantMsg)
+		})
+	}
+}
+
+// TestOpenMetricsTailErrorReportsLine makes sure a malformed tail sample is
+// reported at its own line and that the families decoded before it are not
+// silently treated as the complete result.
+func TestOpenMetricsTailErrorReportsLine(t *testing.T) {
+	format := FmtOpenMetrics_1_0_0.WithEscapingScheme(model.NoEscaping)
+	input := `# TYPE good gauge
+good 1
+this-is-not-valid
+# EOF
+`
+	dec := NewDecoder(strings.NewReader(input), format)
+
+	var first dto.MetricFamily
+	err := dec.Decode(&first)
+	require.Error(t, err)
+	var parseErr ParseError
+	require.ErrorAs(t, err, &parseErr)
+	require.Equal(t, 3, parseErr.Line)
+
+	// The decoder latches onto the error rather than recovering.
+	var second dto.MetricFamily
+	require.Error(t, dec.Decode(&second))
+}

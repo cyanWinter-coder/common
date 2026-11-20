@@ -15,6 +15,7 @@ package expfmt
 
 import (
 	"errors"
+	"io"
 	"math"
 	"strings"
 	"testing"
@@ -1411,6 +1412,290 @@ func TestTextParseMissingMetricName(t *testing.T) {
 func BenchmarkParseError(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		testTextParseError(b)
+	}
+}
+
+// TestTextParserReuseIsolation makes sure that reusing one TextParser for
+// several inputs never leaks descriptors, metric families, or summary/
+// histogram state from one parse into the next.
+func TestTextParserReuseIsolation(t *testing.T) {
+	p := NewTextParser(model.UTF8Validation)
+
+	// The first input exercises every descriptor kind and the summary and
+	// histogram caches.
+	first := `# HELP first_metric A help string.
+# TYPE first_metric counter
+first_metric{job="a"} 1
+# TYPE first_histogram histogram
+first_histogram_bucket{le="1"} 1
+first_histogram_bucket{le="+Inf"} 1
+first_histogram_sum 1
+first_histogram_count 1
+# TYPE first_summary summary
+first_summary{quantile="0.5"} 1
+first_summary_sum 1
+first_summary_count 1
+`
+	firstOut, err := p.TextToMetricFamilies(strings.NewReader(first))
+	if err != nil {
+		t.Fatalf("first parse: %v", err)
+	}
+	if _, ok := firstOut["first_metric"]; !ok {
+		t.Fatalf("first parse lost first_metric: %v", firstOut)
+	}
+
+	// The second input must start from a clean state: none of the first
+	// input's descriptors may show up, and the new family must not inherit
+	// the help text or type of a same-shaped earlier parse.
+	secondOut, err := p.TextToMetricFamilies(strings.NewReader("second_metric 2\n"))
+	if err != nil {
+		t.Fatalf("second parse: %v", err)
+	}
+	if len(secondOut) != 1 {
+		t.Fatalf("expected exactly one family, got %v", secondOut)
+	}
+	mf, ok := secondOut["second_metric"]
+	if !ok {
+		t.Fatalf("expected second_metric, got %v", secondOut)
+	}
+	if mf.GetHelp() != "" {
+		t.Errorf("second_metric inherited help text %q", mf.GetHelp())
+	}
+	if mf.GetType() != dto.MetricType_UNTYPED {
+		t.Errorf("second_metric inherited type %v", mf.GetType())
+	}
+	for name := range secondOut {
+		if strings.HasPrefix(name, "first_") {
+			t.Errorf("family %q from the previous input leaked into the next", name)
+		}
+	}
+
+	// A third parse reuses the parser again to prove the clean state is not
+	// a one-shot effect of the first reset.
+	thirdOut, err := p.TextToMetricFamilies(strings.NewReader("# TYPE third_metric gauge\nthird_metric 3\n"))
+	if err != nil {
+		t.Fatalf("third parse: %v", err)
+	}
+	if len(thirdOut) != 1 || thirdOut["third_metric"].GetType() != dto.MetricType_GAUGE {
+		t.Fatalf("unexpected third parse result: %v", thirdOut)
+	}
+}
+
+// TestTextParserReuseAfterSummaryAndHistogram ensures the summary and
+// histogram signature maps cannot merge metrics across parses when two
+// inputs happen to use the same label signature.
+func TestTextParserReuseAfterSummaryAndHistogram(t *testing.T) {
+	p := NewTextParser(model.UTF8Validation)
+
+	first := `# TYPE h histogram
+h_bucket{le="1"} 1
+h_bucket{le="+Inf"} 1
+h_sum 1
+h_count 1
+# TYPE s summary
+s{quantile="0.5"} 1
+s_sum 1
+s_count 1
+`
+	if _, err := p.TextToMetricFamilies(strings.NewReader(first)); err != nil {
+		t.Fatalf("first parse: %v", err)
+	}
+
+	second := `# TYPE h histogram
+h_bucket{le="2"} 2
+h_bucket{le="+Inf"} 2
+h_sum 2
+h_count 2
+# TYPE s summary
+s{quantile="0.5"} 2
+s_sum 2
+s_count 2
+`
+	out, err := p.TextToMetricFamilies(strings.NewReader(second))
+	if err != nil {
+		t.Fatalf("second parse: %v", err)
+	}
+	h := out["h"].GetMetric()[0].GetHistogram()
+	if got := h.GetBucket()[0].GetUpperBound(); got != 2 {
+		t.Errorf("histogram bucket leaked across parses: got upper bound %v, want 2", got)
+	}
+	if len(h.GetBucket()) != 2 {
+		t.Errorf("histogram kept buckets from the previous parse: %v", h.GetBucket())
+	}
+	s := out["s"].GetMetric()[0].GetSummary()
+	if got := s.GetQuantile()[0].GetValue(); got != 2 {
+		t.Errorf("summary quantile leaked across parses: got %v, want 2", got)
+	}
+	if len(s.GetQuantile()) != 1 {
+		t.Errorf("summary kept quantiles from the previous parse: %v", s.GetQuantile())
+	}
+}
+
+// TestTextParseFailureReturnsNoFamilies pins down that a failed parse only
+// returns the error and never the partially parsed metric families.
+func TestTextParseFailureReturnsNoFamilies(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+	}{
+		{
+			name: "bad value in the middle",
+			in:   "good 1\nbad not-a-float\n",
+		},
+		{
+			name: "bad value at the tail",
+			in:   "good 1\n# TYPE good counter\nbad not-a-float\n",
+		},
+		{
+			name: "premature end of input",
+			in:   "good 1\nbad",
+		},
+		{
+			name: "duplicate descriptor",
+			in:   "# TYPE m gauge\n# TYPE m counter\nm 1\n",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := NewTextParser(model.UTF8Validation)
+			out, err := p.TextToMetricFamilies(strings.NewReader(tc.in))
+			if err == nil {
+				t.Fatalf("expected parse error, got families %v", out)
+			}
+			if out != nil {
+				t.Fatalf("failed parse must not expose partial families, got %v", out)
+			}
+			var parseErr ParseError
+			if !errors.As(err, &parseErr) {
+				t.Fatalf("expected a ParseError, got %T: %v", err, err)
+			}
+		})
+	}
+}
+
+// TestTextParserRetryAfterError verifies that a parser which failed on one
+// input can parse a fresh input, and that retrying with the same reader does
+// not consume the previous error state or stale buffered bytes.
+func TestTextParserRetryAfterError(t *testing.T) {
+	p := NewTextParser(model.UTF8Validation)
+
+	if _, err := p.TextToMetricFamilies(strings.NewReader("good 1\nbad not-a-float\n")); err == nil {
+		t.Fatal("expected the first parse to fail")
+	}
+
+	out, err := p.TextToMetricFamilies(strings.NewReader("retry 1\n"))
+	if err != nil {
+		t.Fatalf("retry after a failed parse: %v", err)
+	}
+	if len(out) != 1 || out["retry"] == nil {
+		t.Fatalf("retry did not start from a clean state: %v", out)
+	}
+
+	// Reusing the exact same reader (already fully consumed) must report the
+	// clean end of input, not the error recorded during the earlier parse.
+	r := strings.NewReader("same_reader 1\n")
+	if _, err := p.TextToMetricFamilies(r); err != nil {
+		t.Fatalf("first read of reused reader: %v", err)
+	}
+	out, err = p.TextToMetricFamilies(r)
+	if err != nil {
+		t.Fatalf("retrying the same reader surfaced a stale error: %v", err)
+	}
+	if len(out) != 0 {
+		t.Fatalf("exhausted reader should parse to zero families, got %v", out)
+	}
+
+	// Fail on a seekable reader and retry the very same reader after seeking
+	// back to its start: the second attempt must run against a clean parser
+	// state instead of inheriting the first attempt's error or partial map.
+	seekable := strings.NewReader("seeked 1\nbroken not-a-float\n")
+	if _, err := p.TextToMetricFamilies(seekable); err == nil {
+		t.Fatal("expected the seekable parse to fail")
+	}
+	if _, err := seekable.Seek(0, io.SeekStart); err != nil {
+		t.Fatalf("seek: %v", err)
+	}
+	if _, err := p.TextToMetricFamilies(seekable); err == nil {
+		t.Fatal("retrying the same malformed reader must reproduce the parse error")
+	}
+	// After the second failure the parser is still reusable for valid input.
+	out, err = p.TextToMetricFamilies(strings.NewReader("final 1\n"))
+	if err != nil {
+		t.Fatalf("parse after repeated failures: %v", err)
+	}
+	if len(out) != 1 || out["final"] == nil {
+		t.Fatalf("parser did not recover cleanly: %v", out)
+	}
+}
+
+// TestTextParserDuplicateDescriptors locks in that duplicate HELP and TYPE
+// descriptors, including type conflicts, are rejected at the line where the
+// second descriptor appears.
+func TestTextParserDuplicateDescriptors(t *testing.T) {
+	cases := []struct {
+		name     string
+		in       string
+		wantLine int
+		wantMsg  string
+	}{
+		{
+			name:     "duplicate TYPE with conflicting type after samples",
+			in:       "# TYPE m gauge\nm 1\n# TYPE m counter\n",
+			wantLine: 3,
+			wantMsg:  `second TYPE line for metric name "m", or TYPE reported after samples`,
+		},
+		{
+			name:     "duplicate TYPE with conflicting type before samples",
+			in:       "# TYPE m gauge\n# TYPE m counter\nm 1\n",
+			wantLine: 2,
+			wantMsg:  `second TYPE line for metric name "m", or TYPE reported after samples`,
+		},
+		{
+			name:     "duplicate identical TYPE",
+			in:       "# TYPE m gauge\n# TYPE m gauge\n",
+			wantLine: 2,
+			wantMsg:  `second TYPE line for metric name "m", or TYPE reported after samples`,
+		},
+		{
+			name:     "TYPE after implicit samples",
+			in:       "m 1\n# TYPE m counter\n",
+			wantLine: 2,
+			wantMsg:  `second TYPE line for metric name "m", or TYPE reported after samples`,
+		},
+		{
+			name:     "duplicate HELP",
+			in:       "# HELP m first\n# HELP m second\n",
+			wantLine: 2,
+			wantMsg:  `second HELP line for metric name "m"`,
+		},
+		{
+			name:     "duplicate HELP after samples",
+			in:       "# HELP m first\nm 1\n# HELP m second\n",
+			wantLine: 3,
+			wantMsg:  `second HELP line for metric name "m"`,
+		},
+		{
+			name:     "TYPE conflict through summary suffix family",
+			in:       "# TYPE s summary\ns_count 1\n# TYPE s counter\n",
+			wantLine: 3,
+			wantMsg:  `second TYPE line for metric name "s", or TYPE reported after samples`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := NewTextParser(model.UTF8Validation)
+			out, err := p.TextToMetricFamilies(strings.NewReader(tc.in))
+			var parseErr ParseError
+			if !errors.As(err, &parseErr) {
+				t.Fatalf("expected ParseError, got %v (families %v)", err, out)
+			}
+			if parseErr.Line != tc.wantLine {
+				t.Errorf("expected error on line %d, got line %d (%v)", tc.wantLine, parseErr.Line, parseErr)
+			}
+			if parseErr.Msg != tc.wantMsg {
+				t.Errorf("expected message %q, got %q", tc.wantMsg, parseErr.Msg)
+			}
+		})
 	}
 }
 
