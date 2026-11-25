@@ -305,3 +305,22 @@ func BenchmarkJSONMarshallingSamplePairMatrix(b *testing.B) {
 		require.NoErrorf(b, err, "error marshalling")
 	}
 }
+
+func TestSampleValueUnquotedJSON(t *testing.T) {
+	var v SampleValue
+	if err := json.Unmarshal([]byte(`1.5`), &v); err != nil {
+		t.Fatalf("bare number rejected: %v", err)
+	}
+	if v != 1.5 {
+		t.Errorf("expected 1.5, got %v", v)
+	}
+	if err := json.Unmarshal([]byte(`"NaN"`), &v); err != nil {
+		t.Fatalf("quoted NaN rejected: %v", err)
+	}
+	if !math.IsNaN(float64(v)) {
+		t.Errorf("expected NaN, got %v", v)
+	}
+	if err := json.Unmarshal([]byte(`"not-a-number"`), &v); err == nil {
+		t.Error("expected error for invalid value")
+	}
+}

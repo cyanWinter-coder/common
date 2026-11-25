@@ -28,14 +28,16 @@ import (
 // to signal a non-existing Sample.
 var ZeroSample = Sample{Timestamp: Earliest}
 
-// Sample is a sample pair associated with a metric. A single sample must either
-// define Value or Histogram but not both. Histogram == nil implies the Value
-// field is used, otherwise it should be ignored.
+// Sample is a sample pair associated with a metric. A single sample must
+// define exactly one of Value, Histogram or Summary. Histogram == nil and
+// Summary == nil implies the Value field is used, otherwise it should be
+// ignored.
 type Sample struct {
 	Metric    Metric           `json:"metric"`
 	Value     SampleValue      `json:"value"`
 	Timestamp Time             `json:"timestamp"`
 	Histogram *SampleHistogram `json:"histogram"`
+	Summary   *SampleSummary   `json:"summary"`
 }
 
 // Equal compares first the metrics, then the timestamp, then the value. The
@@ -52,7 +54,10 @@ func (s *Sample) Equal(o *Sample) bool {
 		return false
 	}
 	if s.Histogram != nil {
-		return s.Histogram.Equal(o.Histogram)
+		return o.Histogram != nil && s.Histogram.Equal(o.Histogram)
+	}
+	if s.Summary != nil {
+		return o.Summary != nil && s.Summary.Equal(o.Summary)
 	}
 	return s.Value.Equal(o.Value)
 }
@@ -62,6 +67,12 @@ func (s Sample) String() string {
 		return fmt.Sprintf("%s => %s", s.Metric, SampleHistogramPair{
 			Timestamp: s.Timestamp,
 			Histogram: s.Histogram,
+		})
+	}
+	if s.Summary != nil {
+		return fmt.Sprintf("%s => %s", s.Metric, SampleSummaryPair{
+			Timestamp: s.Timestamp,
+			Summary:   s.Summary,
 		})
 	}
 	return fmt.Sprintf("%s => %s", s.Metric, SamplePair{
@@ -85,6 +96,19 @@ func (s Sample) MarshalJSON() ([]byte, error) {
 		}
 		return json.Marshal(&v)
 	}
+	if s.Summary != nil {
+		v := struct {
+			Metric  Metric            `json:"metric"`
+			Summary SampleSummaryPair `json:"summary"`
+		}{
+			Metric: s.Metric,
+			Summary: SampleSummaryPair{
+				Timestamp: s.Timestamp,
+				Summary:   s.Summary,
+			},
+		}
+		return json.Marshal(&v)
+	}
 	v := struct {
 		Metric Metric     `json:"metric"`
 		Value  SamplePair `json:"value"`
@@ -104,6 +128,7 @@ func (s *Sample) UnmarshalJSON(b []byte) error {
 		Metric    Metric              `json:"metric"`
 		Value     SamplePair          `json:"value"`
 		Histogram SampleHistogramPair `json:"histogram"`
+		Summary   SampleSummaryPair   `json:"summary"`
 	}{
 		Metric: s.Metric,
 		Value: SamplePair{
@@ -114,6 +139,10 @@ func (s *Sample) UnmarshalJSON(b []byte) error {
 			Timestamp: s.Timestamp,
 			Histogram: s.Histogram,
 		},
+		Summary: SampleSummaryPair{
+			Timestamp: s.Timestamp,
+			Summary:   s.Summary,
+		},
 	}
 
 	if err := json.Unmarshal(b, &v); err != nil {
@@ -121,10 +150,14 @@ func (s *Sample) UnmarshalJSON(b []byte) error {
 	}
 
 	s.Metric = v.Metric
-	if v.Histogram.Histogram != nil {
+	switch {
+	case v.Histogram.Histogram != nil:
 		s.Timestamp = v.Histogram.Timestamp
 		s.Histogram = v.Histogram.Histogram
-	} else {
+	case v.Summary.Summary != nil:
+		s.Timestamp = v.Summary.Timestamp
+		s.Summary = v.Summary.Summary
+	default:
 		s.Timestamp = v.Value.Timestamp
 		s.Value = v.Value.Value
 	}
@@ -176,52 +209,56 @@ type SampleStream struct {
 	Metric     Metric                `json:"metric"`
 	Values     []SamplePair          `json:"values"`
 	Histograms []SampleHistogramPair `json:"histograms"`
+	Summaries  []SampleSummaryPair   `json:"summaries"`
 }
 
 func (ss SampleStream) String() string {
 	valuesLength := len(ss.Values)
-	vals := make([]string, valuesLength+len(ss.Histograms))
+	vals := make([]string, valuesLength+len(ss.Histograms)+len(ss.Summaries))
 	for i, v := range ss.Values {
 		vals[i] = v.String()
 	}
 	for i, v := range ss.Histograms {
 		vals[i+valuesLength] = v.String()
 	}
+	for i, v := range ss.Summaries {
+		vals[i+valuesLength+len(ss.Histograms)] = v.String()
+	}
 	return fmt.Sprintf("%s =>\n%s", ss.Metric, strings.Join(vals, "\n"))
 }
 
+// MarshalJSON implements json.Marshaler. The metric member is always
+// emitted, followed by the sample kinds that are present, in the order
+// values, histograms, summaries. For backward compatibility an empty
+// SampleStream still emits a "values" member.
 func (ss SampleStream) MarshalJSON() ([]byte, error) {
-	switch {
-	case len(ss.Histograms) > 0 && len(ss.Values) > 0:
-		v := struct {
-			Metric     Metric                `json:"metric"`
-			Values     []SamplePair          `json:"values"`
-			Histograms []SampleHistogramPair `json:"histograms"`
-		}{
-			Metric:     ss.Metric,
-			Values:     ss.Values,
-			Histograms: ss.Histograms,
-		}
-		return json.Marshal(&v)
-	case len(ss.Histograms) > 0:
-		v := struct {
-			Metric     Metric                `json:"metric"`
-			Histograms []SampleHistogramPair `json:"histograms"`
-		}{
-			Metric:     ss.Metric,
-			Histograms: ss.Histograms,
-		}
-		return json.Marshal(&v)
-	default:
-		v := struct {
-			Metric Metric       `json:"metric"`
-			Values []SamplePair `json:"values"`
-		}{
-			Metric: ss.Metric,
-			Values: ss.Values,
-		}
-		return json.Marshal(&v)
+	metric, err := json.Marshal(ss.Metric)
+	if err != nil {
+		return nil, err
 	}
+	out := fmt.Appendf(nil, `{"metric":%s`, metric)
+	if len(ss.Values) > 0 || (len(ss.Histograms) == 0 && len(ss.Summaries) == 0) {
+		values, err := json.Marshal(ss.Values)
+		if err != nil {
+			return nil, err
+		}
+		out = fmt.Appendf(out, `,"values":%s`, values)
+	}
+	if len(ss.Histograms) > 0 {
+		histograms, err := json.Marshal(ss.Histograms)
+		if err != nil {
+			return nil, err
+		}
+		out = fmt.Appendf(out, `,"histograms":%s`, histograms)
+	}
+	if len(ss.Summaries) > 0 {
+		summaries, err := json.Marshal(ss.Summaries)
+		if err != nil {
+			return nil, err
+		}
+		out = fmt.Appendf(out, `,"summaries":%s`, summaries)
+	}
+	return append(out, '}'), nil
 }
 
 // Scalar is a scalar value evaluated at the set timestamp.
