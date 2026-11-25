@@ -94,7 +94,7 @@ func MetricFamilyToOpenMetrics20(out io.Writer, in *dto.MetricFamily, options ..
 
 	var (
 		n          int
-		metricType = in.GetType()
+		metricType = metricFamilyType(in)
 	)
 
 	// Comments, first HELP, then TYPE.

@@ -215,6 +215,34 @@ func matchFormat(ac goautoneg.Accept, f Format) bool {
 	return true
 }
 
+// metricFamilyType returns the declared metric type. Families without type
+// information default to untyped, matching the text parser. The historical
+// protobuf zero-value default was counter, so counter-shaped families keep
+// that interpretation to remain compatible with existing text output.
+func metricFamilyType(mf *dto.MetricFamily) dto.MetricType {
+	if mf == nil {
+		return dto.MetricType_UNTYPED
+	}
+	if mf.Type != nil {
+		return mf.GetType()
+	}
+	for _, m := range mf.Metric {
+		switch {
+		case m.GetCounter() != nil:
+			return dto.MetricType_COUNTER
+		case m.GetGauge() != nil:
+			return dto.MetricType_GAUGE
+		case m.GetSummary() != nil:
+			return dto.MetricType_SUMMARY
+		case m.GetHistogram() != nil:
+			return dto.MetricType_HISTOGRAM
+		case m.GetUntyped() != nil:
+			return dto.MetricType_UNTYPED
+		}
+	}
+	return dto.MetricType_UNTYPED
+}
+
 // NewEncoder returns a new encoder based on content type negotiation. All
 // Encoder implementations returned by NewEncoder also implement Closer, and
 // callers should always call the Close method. It is currently only required

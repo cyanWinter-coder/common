@@ -85,7 +85,7 @@ func WithCreatedLines() EncoderOption {
 //     the output, the suffix will be truncated from the `# TYPE`, `# HELP` and `# UNIT`
 //     lines. A counter with a missing `_total` suffix is not an error. However,
 //     its type will be set to `unknown` in that case to avoid invalid OpenMetrics
-//     output.
+//     output, and its exemplar and created line are omitted.
 //
 //   - No support for the following (optional) features: info type,
 //     stateset type, gaugehistogram type.
@@ -124,7 +124,7 @@ func MetricFamilyToOpenMetrics(out io.Writer, in *dto.MetricFamily, options ...E
 
 	var (
 		n             int
-		metricType    = in.GetType()
+		metricType    = metricFamilyType(in)
 		compliantName = name
 	)
 	if metricType == dto.MetricType_COUNTER && strings.HasSuffix(compliantName, "_total") {
@@ -236,12 +236,20 @@ func MetricFamilyToOpenMetrics(out io.Writer, in *dto.MetricFamily, options ...E
 					"expected counter in metric %s %s", compliantName, metric,
 				)
 			}
+			// Without the _total suffix the counter is exposed as unknown,
+			// and OpenMetrics allows neither exemplars nor a _created
+			// sample for unknown metrics.
+			hasTotalSuffix := strings.HasSuffix(name, "_total")
+			exemplar := metric.Counter.Exemplar
+			if !hasTotalSuffix {
+				exemplar = nil
+			}
 			n, err = writeOpenMetricsSample(
 				w, compliantName, "", metric, "", 0,
 				metric.Counter.GetValue(), 0, false,
-				metric.Counter.Exemplar,
+				exemplar,
 			)
-			if toOM.withCreatedLines && metric.Counter.CreatedTimestamp != nil {
+			if hasTotalSuffix && toOM.withCreatedLines && metric.Counter.CreatedTimestamp != nil {
 				createdTsBytesWritten, err = writeOpenMetricsCreated(w, compliantName, "_total", metric, "", 0, metric.Counter.GetCreatedTimestamp())
 				n += createdTsBytesWritten
 			}

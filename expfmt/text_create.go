@@ -141,7 +141,7 @@ func MetricFamilyToText(out io.Writer, in *dto.MetricFamily) (written int, err e
 	if err != nil {
 		return written, err
 	}
-	metricType := in.GetType()
+	metricType := metricFamilyType(in)
 	switch metricType {
 	case dto.MetricType_COUNTER:
 		n, err = w.WriteString(" counter\n")
