@@ -101,6 +101,16 @@ func ResponseFormat(h http.Header) Format {
 // and is not intended for high-performance applications.
 // See: https://github.com/prometheus/common/issues/812
 func NewDecoder(r io.Reader, format Format) Decoder {
+	return NewDecoderWithMode(r, format, StrictMode)
+}
+
+// NewDecoderWithMode is like NewDecoder, but it lets the caller select the
+// ParseMode used for the Prometheus text format. In LenientMode, malformed
+// lines are skipped instead of failing the whole input; the skipped lines are
+// reported through the ParseErrors method of the returned Decoder (see
+// ParseErrorReporter). The mode has no effect for other formats, which are
+// decoded exactly as NewDecoder decodes them.
+func NewDecoderWithMode(r io.Reader, format Format, mode ParseMode) Decoder {
 	scheme := model.LegacyValidation
 	if format.ToEscapingScheme() == model.NoEscaping {
 		scheme = model.UTF8Validation
@@ -131,7 +141,21 @@ func NewDecoder(r io.Reader, format Format) Decoder {
 			return &errDecoder{err: fmt.Errorf("format %s not supported for decoding", format)}
 		}
 	}
-	return &textDecoder{r: r, s: scheme}
+	return &textDecoder{r: r, s: scheme, mode: mode}
+}
+
+// ParseErrorReporter is implemented by Decoders that can report the malformed
+// lines they skipped. It is only meaningful for decoders created with
+// NewDecoderWithMode and LenientMode, as those are the only ones that skip
+// malformed input instead of returning an error. In strict mode ParseErrors
+// returns nil.
+//
+// The Prometheus text decoder parses the whole input on its first Decode call,
+// so ParseErrors is already complete after that call. The returned slice is
+// owned by the decoder and must not be modified by the caller.
+type ParseErrorReporter interface {
+	Decoder
+	ParseErrors() []ParseError
 }
 
 // protoDecoder implements the Decoder interface for protocol buffers.
@@ -220,10 +244,12 @@ func (d *openMetrics20Decoder) Decode(v *dto.MetricFamily) error {
 
 // textDecoder implements the Decoder interface for the text protocol.
 type textDecoder struct {
-	r    io.Reader
-	fams map[string]*dto.MetricFamily
-	s    model.ValidationScheme
-	err  error
+	r       io.Reader
+	fams    map[string]*dto.MetricFamily
+	s       model.ValidationScheme
+	mode    ParseMode
+	parseEr []ParseError
+	err     error
 }
 
 // Decode implements the Decoder interface.
@@ -231,7 +257,17 @@ func (d *textDecoder) Decode(v *dto.MetricFamily) error {
 	if d.err == nil {
 		// Read all metrics in one shot.
 		p := NewTextParser(d.s)
-		d.fams, d.err = p.TextToMetricFamilies(d.r)
+		var (
+			res ParseResult
+			err error
+		)
+		if d.mode == LenientMode {
+			res, err = p.ParseMetricFamilies(d.r, LenientMode)
+			d.parseEr = res.Errors
+		} else {
+			res.MetricFamilies, err = p.TextToMetricFamilies(d.r)
+		}
+		d.fams, d.err = res.MetricFamilies, err
 		// If we don't get an error, store io.EOF for the end.
 		if d.err == nil {
 			d.err = io.EOF
@@ -247,6 +283,12 @@ func (d *textDecoder) Decode(v *dto.MetricFamily) error {
 		return nil
 	}
 	return d.err
+}
+
+// ParseErrors implements ParseErrorReporter. It returns the malformed lines
+// skipped while decoding, in input order.
+func (d *textDecoder) ParseErrors() []ParseError {
+	return d.parseEr
 }
 
 // SampleDecoder wraps a Decoder to extract samples from the metric families

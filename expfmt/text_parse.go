@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"slices"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -36,16 +37,94 @@ import (
 // by nil.
 type stateFn func() stateFn
 
+// ParseErrorKind classifies a ParseError. It allows callers to distinguish
+// common malformed-line classes without matching on the error message.
+type ParseErrorKind int
+
+const (
+	// ParseErrorOther is used for errors that do not fall into one of the
+	// more specific classes below.
+	ParseErrorOther ParseErrorKind = iota
+	// ParseErrorDuplicateLabel signals a repeated label name within one
+	// label set.
+	ParseErrorDuplicateLabel
+	// ParseErrorUnclosedQuote signals a quoted string that is not terminated
+	// before the end of the line (or the end of the input).
+	ParseErrorUnclosedQuote
+	// ParseErrorInvalidEscape signals an unsupported backslash escape
+	// sequence.
+	ParseErrorInvalidEscape
+	// ParseErrorTruncatedInput signals that the input ended in the middle of
+	// a sample, so no complete sample could be recovered.
+	ParseErrorTruncatedInput
+)
+
+// String returns a short, stable name for the kind, suitable for logs.
+func (k ParseErrorKind) String() string {
+	switch k {
+	case ParseErrorDuplicateLabel:
+		return "duplicate_label"
+	case ParseErrorUnclosedQuote:
+		return "unclosed_quote"
+	case ParseErrorInvalidEscape:
+		return "invalid_escape"
+	case ParseErrorTruncatedInput:
+		return "truncated_input"
+	default:
+		return "other"
+	}
+}
+
+// Sentinel errors for use with errors.Is. A ParseError unwraps to the
+// sentinel matching its Kind.
+var (
+	// ErrDuplicateLabel matches a ParseError of kind ParseErrorDuplicateLabel.
+	ErrDuplicateLabel = errors.New("duplicate label name")
+	// ErrUnclosedQuote matches a ParseError of kind ParseErrorUnclosedQuote.
+	ErrUnclosedQuote = errors.New("unclosed quote")
+	// ErrInvalidEscape matches a ParseError of kind ParseErrorInvalidEscape.
+	ErrInvalidEscape = errors.New("invalid escape sequence")
+	// ErrTruncatedInput matches a ParseError of kind ParseErrorTruncatedInput.
+	ErrTruncatedInput = errors.New("truncated input")
+)
+
 // ParseError signals errors while parsing the simple and flat text-based
 // exchange format.
+//
+// Line is the 1-based line number of the offending input. Column is the
+// 1-based byte offset within that line where the error was detected; it is
+// zero for errors reported by parsers that do not track columns (for example
+// the OpenMetrics parsers). Fragment contains the beginning of the offending
+// input line, truncated to a bounded number of bytes; it is only populated by
+// the line-oriented recovery APIs.
 type ParseError struct {
-	Line int
-	Msg  string
+	Line     int
+	Column   int
+	Msg      string
+	Kind     ParseErrorKind
+	Fragment string
 }
 
 // Error implements the error interface.
 func (e ParseError) Error() string {
 	return fmt.Sprintf("text format parsing error in line %d: %s", e.Line, e.Msg)
+}
+
+// Unwrap returns the sentinel error matching e.Kind, if there is one. This
+// allows callers to use errors.Is(err, ErrDuplicateLabel) and friends.
+func (e ParseError) Unwrap() error {
+	switch e.Kind {
+	case ParseErrorDuplicateLabel:
+		return ErrDuplicateLabel
+	case ParseErrorUnclosedQuote:
+		return ErrUnclosedQuote
+	case ParseErrorInvalidEscape:
+		return ErrInvalidEscape
+	case ParseErrorTruncatedInput:
+		return ErrTruncatedInput
+	default:
+		return nil
+	}
 }
 
 // TextParser is used to parse the simple and flat text-based exchange format.
@@ -83,6 +162,18 @@ type TextParser struct {
 	// scheme sets the desired ValidationScheme for names. Defaults to the invalid
 	// UnsetValidation.
 	scheme model.ValidationScheme
+
+	// The fields below are only used by the line-oriented ParseMetricFamilies
+	// API. lineMode enables column and fragment reporting. rollback
+	// additionally records how to undo the mutations of a line, which is
+	// required for lenient parsing.
+	lines    *bufio.Reader // Line source; only set in line mode.
+	lineRdr  bytes.Reader  // Reader over the line currently being parsed.
+	lineLen  int           // Length of the buffer the current line is parsed from.
+	lineBuf  []byte        // The current line, including any appended newline.
+	lineMode bool
+	rollback bool
+	journal  []func() // Undo actions for the line currently being parsed.
 }
 
 // NewTextParser returns a new TextParser with the provided nameValidationScheme.
@@ -137,6 +228,213 @@ func (p *TextParser) TextToMetricFamilies(in io.Reader) (map[string]*dto.MetricF
 	return p.metricFamiliesByName, p.err
 }
 
+// ParseMode selects how ParseMetricFamilies treats malformed lines.
+type ParseMode int
+
+const (
+	// StrictMode stops at the first malformed line. The returned map is nil
+	// and the returned error is the first ParseError encountered. This
+	// matches the all-or-nothing behaviour of TextToMetricFamilies.
+	StrictMode ParseMode = iota
+	// LenientMode skips malformed lines and keeps parsing. The returned map
+	// holds every successfully parsed metric family, and the returned error
+	// slice holds one ParseError per skipped line. A map entry is only
+	// created if at least one sample of its metric family parsed
+	// successfully; metadata lines that never get a valid sample are
+	// dropped.
+	LenientMode
+)
+
+// ParseResult is the result of ParseMetricFamilies.
+type ParseResult struct {
+	// MetricFamilies holds all successfully parsed metric families, keyed by
+	// metric name. It is nil in strict mode if parsing failed.
+	MetricFamilies map[string]*dto.MetricFamily
+	// Errors holds one entry per malformed line, in input order. It is nil
+	// if no line failed.
+	Errors []ParseError
+}
+
+// ParseMetricFamilies reads 'in' as the simple and flat text-based exchange
+// format, line by line, creating MetricFamily proto messages.
+//
+// Unlike TextToMetricFamilies, it understands the location of a problem and,
+// in LenientMode, can continue past it:
+//
+//   - Parsing is line-oriented, so a bad line never prevents later lines from
+//     being parsed. A trailing line without a final newline is still parsed,
+//     and a line cut off in the middle of a sample is reported as an error
+//     (ParseErrorTruncatedInput) instead of yielding a half sample.
+//   - Every ParseError carries the 1-based Line, the 1-based byte Column
+//     within that line, and a bounded Fragment of the original text.
+//   - ParseError.Kind (also available via errors.Is) distinguishes duplicate
+//     label names, unclosed quotes, invalid escape sequences, and truncated
+//     input from other errors.
+//   - I/O errors other than io.EOF abort parsing and are returned as the
+//     error of the (otherwise successful) result pair. They are not included
+//     in ParseResult.Errors, which is reserved for malformed input.
+//
+// In StrictMode the result is a nil map plus the first ParseError, and
+// ParseMetricFamilies returns that error as well. In LenientMode the error
+// return is nil unless the underlying reader fails; malformed lines are
+// reported through ParseResult.Errors.
+//
+// Memory use is bounded by the longest single line plus the accumulated
+// result, not by the whole input, so arbitrary large inputs can be streamed.
+//
+// This method must not be called concurrently. If you want to parse different
+// input concurrently, instantiate a separate TextParser for each goroutine.
+func (p *TextParser) ParseMetricFamilies(in io.Reader, mode ParseMode) (ParseResult, error) {
+	p.resetState()
+	p.lines = bufio.NewReader(in)
+	// The state machine reads through p.buf. Point it at the current line
+	// instead of the whole input; parseLine re-seats it for every line.
+	p.buf = bufio.NewReader(&p.lineRdr)
+	p.lineMode = true
+	p.rollback = mode == LenientMode
+	defer func() {
+		p.lineMode = false
+		p.rollback = false
+		p.journal = p.journal[:0]
+		// Drop both readers so that a later TextToMetricFamilies call creates
+		// a fresh one for the reader handed to it.
+		p.buf = nil
+		p.lines = nil
+	}()
+
+	var result ParseResult
+	lineNo := 0
+	for {
+		frag, err := p.lines.ReadSlice('\n')
+		var line []byte
+		if errors.Is(err, bufio.ErrBufferFull) {
+			// A line longer than the reader's buffer: keep accumulating it
+			// rather than treating the buffer boundary as a line end.
+			pending := append([]byte(nil), frag...)
+			var rerr error
+			line, rerr = p.readLongLine(pending)
+			frag, err = line, rerr
+		}
+		if len(frag) > 0 {
+			lineNo++
+			if perr := p.parseLine(frag, lineNo); perr != nil {
+				if mode == StrictMode {
+					return ParseResult{}, *perr
+				}
+				result.Errors = append(result.Errors, *perr)
+			}
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			// Surface a reader error that is not EOF after the last line we
+			// could parse, rather than waiting for a line that will never come.
+			p.finalizeFamilies()
+			result.MetricFamilies = p.metricFamiliesByName
+			return result, err
+		}
+	}
+	p.finalizeFamilies()
+	result.MetricFamilies = p.metricFamiliesByName
+	return result, nil
+}
+
+// readLongLine continues reading a line that overflows bufio.Reader's buffer.
+// It returns the complete line and, if reading stopped on an error rather than
+// a newline, that error.
+func (p *TextParser) readLongLine(prefix []byte) ([]byte, error) {
+	line := prefix
+	for {
+		frag, err := p.lines.ReadSlice('\n')
+		line = append(line, frag...)
+		if err == nil {
+			return line, nil
+		}
+		if !errors.Is(err, bufio.ErrBufferFull) {
+			return line, err
+		}
+	}
+}
+
+// finalizeFamilies removes metric families that ended up with no metrics and
+// normalizes float histograms. It mirrors the post-processing of
+// TextToMetricFamilies.
+func (p *TextParser) finalizeFamilies() {
+	for k, mf := range p.metricFamiliesByName {
+		if len(mf.GetMetric()) == 0 {
+			delete(p.metricFamiliesByName, k)
+		}
+	}
+	for _, histogramMetric := range p.histograms {
+		normalizeHistogram(histogramMetric.GetHistogram())
+	}
+}
+
+// parseLine parses exactly one line (with or without its trailing newline) as
+// input line number lineNo. It returns a ParseError if the line is malformed.
+// p.err is cleared before it returns so that a later line is not affected.
+func (p *TextParser) parseLine(line []byte, lineNo int) *ParseError {
+	p.resetLineState()
+	// startOfLine advances lineCount by one, so start just before this line.
+	p.lineCount = lineNo - 1
+
+	// A final line without a newline is normal input, not a truncation. The
+	// parser states treat a missing newline at end of input as "unexpected end
+	// of input stream", so append one and remember that the original line had
+	// none.
+	truncated := line[len(line)-1] != '\n'
+	if truncated {
+		buf := make([]byte, len(line)+1)
+		copy(buf, line)
+		buf[len(line)] = '\n'
+		p.lineBuf = buf
+	} else {
+		p.lineBuf = line
+	}
+	p.lineRdr.Reset(p.lineBuf)
+	p.lineLen = p.lineRdr.Len()
+	if p.buf == nil {
+		p.buf = bufio.NewReader(&p.lineRdr)
+	} else {
+		p.buf.Reset(&p.lineRdr)
+	}
+
+	for nextState := p.startOfLine; nextState != nil; nextState = nextState() {
+		// Magic happens here...
+	}
+	err := p.err
+	p.err = nil
+	p.currentMF = nil
+	if err == nil {
+		p.commit()
+		return nil
+	}
+	var perr ParseError
+	if !errors.As(err, &perr) {
+		// Only the in-memory line reader produces p.err here, and it never
+		// fails, so anything that is not a ParseError comes from a
+		// non-reporting path. Wrap it rather than losing it.
+		perr = ParseError{Line: p.lineCount, Msg: err.Error()}
+		if p.lineMode {
+			perr.Column = p.column()
+			perr.Fragment = truncateFragment(p.lineBuf)
+		}
+	}
+	// A line that ends without a newline but is otherwise complete is not an
+	// error; the parser completes it because of the synthetic newline above.
+	// But if such a line cannot be finished, the input was most likely cut
+	// off in the middle of a sample. Say so, unless the failure already has a
+	// more specific classification (a truncated line can still contain, say, a
+	// duplicate label).
+	if truncated && perr.Kind == ParseErrorOther {
+		perr.Kind = ParseErrorTruncatedInput
+		perr.Msg += " (input ended without a trailing newline; no sample was produced)"
+	}
+	p.undo()
+	return &perr
+}
+
 // normalizeHistogram makes sure that all the buckets and the count in each
 // histogram is either completely float or completely integer.
 func normalizeHistogram(histogram *dto.Histogram) {
@@ -170,24 +468,60 @@ func normalizeHistogram(histogram *dto.Histogram) {
 }
 
 func (p *TextParser) reset(in io.Reader) {
-	p.metricFamiliesByName = map[string]*dto.MetricFamily{}
-	p.currentLabelPairs = nil
+	p.resetState()
+	p.lineMode = false
+	p.rollback = false
+	p.lines = nil
 	if p.buf == nil {
 		p.buf = bufio.NewReader(in)
 	} else {
 		p.buf.Reset(in)
 	}
+}
+
+// resetState clears all per-parse state. It is shared by the whole-input
+// (TextToMetricFamilies) and line-oriented (ParseMetricFamilies) entry points.
+// The name validation scheme is configuration and is intentionally preserved.
+func (p *TextParser) resetState() {
+	p.metricFamiliesByName = map[string]*dto.MetricFamily{}
 	p.err = nil
 	p.lineCount = 0
+	p.lineMode = false
+	p.rollback = false
+	p.lineBuf = nil
+	p.lines = nil
+	p.lineRdr.Reset(nil)
+	p.lineLen = 0
+	p.journal = p.journal[:0]
+	p.resetLineState()
 	if p.summaries == nil || len(p.summaries) > 0 {
 		p.summaries = map[uint64]*dto.Metric{}
 	}
 	if p.histograms == nil || len(p.histograms) > 0 {
 		p.histograms = map[uint64]*dto.Metric{}
 	}
+	p.currentMF = nil
+}
+
+// resetLineState clears the state that must not leak from one line to the next.
+// Metric families and the summary/histogram registries outlive a line and are
+// deliberately not touched here.
+func (p *TextParser) resetLineState() {
+	p.currentByte = 0
+	p.currentToken.Reset()
+	p.currentMetric = nil
+	p.currentLabelPair = nil
+	p.currentLabelPairs = nil
+	p.currentLabels = nil
 	p.currentQuantile = math.NaN()
 	p.currentBucket = math.NaN()
-	p.currentMF = nil
+	p.currentIsSummaryCount = false
+	p.currentIsSummarySum = false
+	p.currentIsHistogramCount = false
+	p.currentIsHistogramSum = false
+	p.currentMetricIsInsideBraces = false
+	p.currentMetricInsideBracesIsPresent = false
+	p.journal = p.journal[:0]
 }
 
 // startOfLine represents the state where the next byte read from p.buf is the
@@ -299,7 +633,7 @@ func (p *TextParser) readingMetricName() stateFn {
 	}
 	// Now is the time to fix the type if it hasn't happened yet.
 	if p.currentMF.Type == nil {
-		p.currentMF.Type = dto.MetricType_UNTYPED.Enum()
+		p.setMetricFamilyType(p.currentMF, dto.MetricType_UNTYPED)
 	}
 	p.currentMetric = &dto.Metric{}
 	// Do not append the newly created currentMetric to
@@ -379,7 +713,7 @@ func (p *TextParser) startLabelName() stateFn {
 					return nil
 				}
 				if p.currentMF.Type == nil {
-					p.currentMF.Type = dto.MetricType_UNTYPED.Enum()
+					p.setMetricFamilyType(p.currentMF, dto.MetricType_UNTYPED)
 				}
 				p.currentMetric = &dto.Metric{}
 				p.currentMetricInsideBracesIsPresent = true
@@ -391,7 +725,7 @@ func (p *TextParser) startLabelName() stateFn {
 					return nil
 				}
 				if p.currentMF.Type == nil {
-					p.currentMF.Type = dto.MetricType_UNTYPED.Enum()
+					p.setMetricFamilyType(p.currentMF, dto.MetricType_UNTYPED)
 				}
 				p.currentMetric = &dto.Metric{}
 				p.currentMetric.Label = append(p.currentMetric.Label, p.currentLabelPairs...)
@@ -433,7 +767,7 @@ func (p *TextParser) startLabelName() stateFn {
 	for _, l := range p.currentLabelPairs {
 		lName := l.GetName()
 		if _, exists := labels[lName]; exists {
-			p.parseError(fmt.Sprintf("duplicate label names for metric %q", p.currentMF.GetName()))
+			p.parseErrorKind(ParseErrorDuplicateLabel, fmt.Sprintf("duplicate label names for metric %q", p.currentMF.GetName()))
 			p.currentLabelPairs = nil
 			return nil
 		}
@@ -523,20 +857,22 @@ func (p *TextParser) readingValue() stateFn {
 		signature := model.LabelsToSignature(p.currentLabels)
 		if summary := p.summaries[signature]; summary != nil {
 			p.currentMetric = summary
+			p.journalReusedMetric(summary)
 		} else {
-			p.summaries[signature] = p.currentMetric
-			p.currentMF.Metric = append(p.currentMF.Metric, p.currentMetric)
+			p.registerSummary(signature, p.currentMetric)
+			p.appendMetric(p.currentMF, p.currentMetric)
 		}
 	case dto.MetricType_HISTOGRAM, dto.MetricType_GAUGE_HISTOGRAM:
 		signature := model.LabelsToSignature(p.currentLabels)
 		if histogram := p.histograms[signature]; histogram != nil {
 			p.currentMetric = histogram
+			p.journalReusedMetric(histogram)
 		} else {
-			p.histograms[signature] = p.currentMetric
-			p.currentMF.Metric = append(p.currentMF.Metric, p.currentMetric)
+			p.registerHistogram(signature, p.currentMetric)
+			p.appendMetric(p.currentMF, p.currentMetric)
 		}
 	default:
-		p.currentMF.Metric = append(p.currentMF.Metric, p.currentMetric)
+		p.appendMetric(p.currentMF, p.currentMetric)
 	}
 	if p.readTokenUntilWhitespace(); p.err != nil {
 		return nil // Unexpected end of input.
@@ -652,7 +988,7 @@ func (p *TextParser) readingHelp() stateFn {
 	if p.readTokenUntilNewline(true); p.err != nil {
 		return nil // Unexpected end of input.
 	}
-	p.currentMF.Help = proto.String(p.currentToken.String())
+	p.setMetricFamilyHelp(p.currentMF, p.currentToken.String())
 	return p.startOfLine
 }
 
@@ -680,17 +1016,172 @@ func (p *TextParser) readingType() stateFn {
 		}
 		metricType = int32(dto.MetricType_GAUGE_HISTOGRAM)
 	}
-	p.currentMF.Type = dto.MetricType(metricType).Enum()
+	p.setMetricFamilyType(p.currentMF, dto.MetricType(metricType))
 	return p.startOfLine
 }
 
-// parseError sets p.err to a ParseError at the current line with the given
-// message.
+// parseError sets p.err to a ParseError of kind ParseErrorOther at the current
+// line with the given message.
 func (p *TextParser) parseError(msg string) {
-	p.err = ParseError{
+	p.parseErrorKind(ParseErrorOther, msg)
+}
+
+// parseErrorKind sets p.err to a ParseError at the current line with the given
+// kind and message. In line mode it also records the column and a bounded
+// fragment of the offending line.
+func (p *TextParser) parseErrorKind(kind ParseErrorKind, msg string) {
+	e := ParseError{
 		Line: p.lineCount,
 		Msg:  msg,
+		Kind: kind,
 	}
+	if p.lineMode {
+		e.Column = p.column()
+		e.Fragment = truncateFragment(p.lineBuf)
+	}
+	p.err = e
+}
+
+// column returns the 1-based byte offset of the most recently read byte within
+// the line currently being parsed. It returns 1 if no byte has been consumed
+// yet and 0 outside of line mode, where no column is tracked.
+func (p *TextParser) column() int {
+	if !p.lineMode || p.buf == nil {
+		return 0
+	}
+	consumed := p.lineLen - (p.buf.Buffered() + p.lineRdr.Len())
+	if consumed < 1 {
+		return 1
+	}
+	return consumed
+}
+
+// maxFragmentBytes bounds how much of an offending line is kept in
+// ParseError.Fragment, so that a single pathological line cannot inflate the
+// memory used by an error list.
+const maxFragmentBytes = 64
+
+// truncateFragment returns at most maxFragmentBytes of line, with the trailing
+// newline removed and without splitting a UTF-8 rune. A truncated fragment is
+// suffixed with "…" to make the truncation visible.
+func truncateFragment(line []byte) string {
+	line = bytes.TrimSuffix(line, []byte("\n"))
+	line = bytes.TrimSuffix(line, []byte("\r"))
+	if len(line) <= maxFragmentBytes {
+		return string(line)
+	}
+	cut := maxFragmentBytes
+	// Back off to the start of a rune so the fragment stays valid UTF-8.
+	for cut > 0 && !utf8.RuneStart(line[cut]) {
+		cut--
+	}
+	return string(line[:cut]) + "…"
+}
+
+// addMetricFamily stores a newly created metric family, recording an undo
+// action in lenient line mode.
+func (p *TextParser) addMetricFamily(name string, mf *dto.MetricFamily) {
+	p.metricFamiliesByName[name] = mf
+	if p.rollback {
+		p.journal = append(p.journal, func() { delete(p.metricFamiliesByName, name) })
+	}
+}
+
+// registerSummary maps signature to m, recording an undo action in lenient
+// line mode.
+func (p *TextParser) registerSummary(signature uint64, m *dto.Metric) {
+	p.summaries[signature] = m
+	if p.rollback {
+		p.journal = append(p.journal, func() { delete(p.summaries, signature) })
+	}
+}
+
+// registerHistogram maps signature to m, recording an undo action in lenient
+// line mode.
+func (p *TextParser) registerHistogram(signature uint64, m *dto.Metric) {
+	p.histograms[signature] = m
+	if p.rollback {
+		p.journal = append(p.journal, func() { delete(p.histograms, signature) })
+	}
+}
+
+// appendMetric appends m to mf's metrics, recording an undo action in lenient
+// line mode so that a line that later fails leaves no trace.
+func (p *TextParser) appendMetric(mf *dto.MetricFamily, m *dto.Metric) {
+	n := len(mf.Metric)
+	mf.Metric = append(mf.Metric, m)
+	if p.rollback {
+		p.journal = append(p.journal, func() { mf.Metric = mf.Metric[:n] })
+	}
+}
+
+// setMetricFamilyType sets mf's type, recording an undo action in lenient line
+// mode.
+func (p *TextParser) setMetricFamilyType(mf *dto.MetricFamily, t dto.MetricType) {
+	old := mf.Type
+	mf.Type = t.Enum()
+	if p.rollback {
+		p.journal = append(p.journal, func() { mf.Type = old })
+	}
+}
+
+// setMetricFamilyHelp sets mf's help, recording an undo action in lenient line
+// mode.
+func (p *TextParser) setMetricFamilyHelp(mf *dto.MetricFamily, help string) {
+	old := mf.Help
+	mf.Help = proto.String(help)
+	if p.rollback {
+		p.journal = append(p.journal, func() { mf.Help = old })
+	}
+}
+
+// journalReusedMetric snapshots the mutable parts of a summary or histogram
+// metric that is continued (rather than created) on the current line. A line
+// like "foo_sum 1 not-a-timestamp" mutates foo before the timestamp is found to
+// be invalid; in lenient line mode that mutation has to be undone.
+func (p *TextParser) journalReusedMetric(m *dto.Metric) {
+	if !p.rollback {
+		return
+	}
+	ts, summary, histogram := m.TimestampMs, m.Summary, m.Histogram
+	var (
+		qLen, bLen          int
+		sCount, hCount      *uint64
+		sSum, hSum, hCountF *float64
+	)
+	if summary != nil {
+		qLen, sCount, sSum = len(summary.Quantile), summary.SampleCount, summary.SampleSum
+	}
+	if histogram != nil {
+		bLen, hCount, hCountF, hSum = len(histogram.Bucket), histogram.SampleCount, histogram.SampleCountFloat, histogram.SampleSum
+	}
+	p.journal = append(p.journal, func() {
+		m.TimestampMs, m.Summary, m.Histogram = ts, summary, histogram
+		if summary != nil {
+			summary.Quantile = summary.Quantile[:qLen]
+			summary.SampleCount, summary.SampleSum = sCount, sSum
+		}
+		if histogram != nil {
+			histogram.Bucket = histogram.Bucket[:bLen]
+			histogram.SampleCount, histogram.SampleCountFloat = hCount, hCountF
+			histogram.SampleSum = hSum
+		}
+	})
+}
+
+// undo reverts the mutations recorded for the line currently being parsed so
+// that no partially parsed sample or metadata leaks into the result. Undo
+// actions are reverted in reverse order, like a stack.
+func (p *TextParser) undo() {
+	for _, f := range slices.Backward(p.journal) {
+		f()
+	}
+	p.journal = p.journal[:0]
+}
+
+// commit discards the undo journal of a line that parsed successfully.
+func (p *TextParser) commit() {
+	p.journal = p.journal[:0]
 }
 
 // skipBlankTab reads (and discards) bytes from p.buf until it encounters a byte
@@ -742,7 +1233,7 @@ func (p *TextParser) readTokenUntilNewline(recognizeEscapeSequence bool) {
 			case '"':
 				p.currentToken.WriteByte('"')
 			default:
-				p.parseError(fmt.Sprintf("invalid escape sequence '\\%c'", p.currentByte))
+				p.parseErrorKind(ParseErrorInvalidEscape, fmt.Sprintf("invalid escape sequence '\\%c'", p.currentByte))
 				return
 			}
 			escaped = false
@@ -782,7 +1273,7 @@ func (p *TextParser) readTokenAsMetricName() {
 			case '"':
 				p.currentToken.WriteByte('"')
 			default:
-				p.parseError(fmt.Sprintf("invalid escape sequence '\\%c'", p.currentByte))
+				p.parseErrorKind(ParseErrorInvalidEscape, fmt.Sprintf("invalid escape sequence '\\%c'", p.currentByte))
 				return
 			}
 			escaped = false
@@ -795,7 +1286,7 @@ func (p *TextParser) readTokenAsMetricName() {
 					return
 				}
 			case '\n':
-				p.parseError(fmt.Sprintf("metric name %q contains unescaped new-line", p.currentToken.String()))
+				p.parseErrorKind(ParseErrorUnclosedQuote, fmt.Sprintf("metric name %q contains unescaped new-line", p.currentToken.String()))
 				return
 			case '\\':
 				escaped = true
@@ -832,7 +1323,7 @@ func (p *TextParser) readTokenAsLabelName() {
 			case '"':
 				p.currentToken.WriteByte('"')
 			default:
-				p.parseError(fmt.Sprintf("invalid escape sequence '\\%c'", p.currentByte))
+				p.parseErrorKind(ParseErrorInvalidEscape, fmt.Sprintf("invalid escape sequence '\\%c'", p.currentByte))
 				return
 			}
 			escaped = false
@@ -845,7 +1336,7 @@ func (p *TextParser) readTokenAsLabelName() {
 					return
 				}
 			case '\n':
-				p.parseError(fmt.Sprintf("label name %q contains unescaped new-line", p.currentToken.String()))
+				p.parseErrorKind(ParseErrorUnclosedQuote, fmt.Sprintf("label name %q contains unescaped new-line", p.currentToken.String()))
 				return
 			case '\\':
 				escaped = true
@@ -879,7 +1370,7 @@ func (p *TextParser) readTokenAsLabelValue() {
 			case 'n':
 				p.currentToken.WriteByte('\n')
 			default:
-				p.parseError(fmt.Sprintf("invalid escape sequence '\\%c'", p.currentByte))
+				p.parseErrorKind(ParseErrorInvalidEscape, fmt.Sprintf("invalid escape sequence '\\%c'", p.currentByte))
 				p.currentLabelPairs = nil
 				return
 			}
@@ -890,7 +1381,7 @@ func (p *TextParser) readTokenAsLabelValue() {
 		case '"':
 			return
 		case '\n':
-			p.parseError(fmt.Sprintf("label value %q contains unescaped new-line", p.currentToken.String()))
+			p.parseErrorKind(ParseErrorUnclosedQuote, fmt.Sprintf("label value %q contains unescaped new-line", p.currentToken.String()))
 			return
 		case '\\':
 			escaped = true
@@ -940,7 +1431,7 @@ func (p *TextParser) setOrCreateCurrentMF() {
 		}
 	}
 	p.currentMF = &dto.MetricFamily{Name: proto.String(name)}
-	p.metricFamiliesByName[name] = p.currentMF
+	p.addMetricFamily(name, p.currentMF)
 }
 
 func isValidLabelNameStart(b byte) bool {
