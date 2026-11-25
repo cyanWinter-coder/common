@@ -1062,6 +1062,9 @@ func TestTLSRoundTripper(t *testing.T) {
 		key  string
 
 		errMsg string
+		// keepLastGood asserts that a failed rotation leaves the previously
+		// working RoundTripper in place.
+		keepLastGood bool
 	}{
 		{
 			// Valid certs.
@@ -1086,31 +1089,37 @@ func TestTLSRoundTripper(t *testing.T) {
 			errMsg: "remote error: tls",
 		},
 		{
-			// CA file empty
+			// CA file empty: the rotation is rejected and the previous
+			// working configuration keeps serving.
 			ca:   EmptyFile,
 			cert: ClientCertificatePath,
 			key:  ClientKeyNoPassPath,
 
-			errMsg: "unable to use specified CA cert",
+			errMsg:       "unable to use specified CA cert",
+			keepLastGood: true,
 		},
 		{
-			// cert file empty
+			// cert file empty: the rotation is rejected before the new
+			// transport is installed.
 			ca:   TLSCAChainPath,
 			cert: EmptyFile,
 			key:  ClientKeyNoPassPath,
 
-			errMsg: "failed to find any PEM data in certificate input",
+			errMsg:       "failed to find any PEM data in certificate input",
+			keepLastGood: true,
 		},
 		{
-			// key file empty
+			// key file empty: same, the last good configuration survives.
 			ca:   TLSCAChainPath,
 			cert: ClientCertificatePath,
 			key:  EmptyFile,
 
-			errMsg: "failed to find any PEM data in key input",
+			errMsg:       "failed to find any PEM data in key input",
+			keepLastGood: true,
 		},
 		{
-			// Valid certs again.
+			// Valid certs again, proving the client never lost the
+			// last-known-good transport.
 			ca:   TLSCAChainPath,
 			cert: ClientCertificatePath,
 			key:  ClientKeyNoPassPath,
@@ -1141,11 +1150,23 @@ func TestTLSRoundTripper(t *testing.T) {
 			require.NoErrorf(t, err, "Error creating HTTP request: %v", err)
 			r, err := c.Do(req)
 			if len(tc.errMsg) > 0 {
-				if err == nil {
-					r.Body.Close()
-					t.Fatalf("Could connect to the test server.")
-				}
 				require.ErrorContainsf(t, err, tc.errMsg, "Expected error message to contain %q, got %q", tc.errMsg, err)
+				if tc.keepLastGood {
+					// The failed rotation must not have replaced the active
+					// transport: restore valid material and confirm the same
+					// client keeps working without being rebuilt.
+					writeCertificate(bs, TLSCAChainPath, ca)
+					writeCertificate(bs, ClientCertificatePath, cert)
+					writeCertificate(bs, ClientKeyNoPassPath, key)
+					req, err = http.NewRequest(http.MethodGet, testServer.URL, nil)
+					require.NoError(t, err)
+					okResp, okErr := c.Do(req)
+					require.NoErrorf(t, okErr, "last known good transport should still serve requests")
+					body, readErr := io.ReadAll(okResp.Body)
+					okResp.Body.Close()
+					require.NoError(t, readErr)
+					require.Equal(t, ExpectedMessage, strings.TrimSpace(string(body)))
+				}
 				return
 			}
 

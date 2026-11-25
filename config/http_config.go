@@ -749,6 +749,13 @@ func NewRoundTripperFromConfigWithContext(ctx context.Context, cfg HTTPClientCon
 		return nil, err
 	}
 
+	// Reject missing, unparseable or expired CA/client-cert material before
+	// any client exists, instead of deferring the failure to the first
+	// request's TLS handshake.
+	if err := validateTLSMaterials(ctx, &cfg.TLSConfig, opts.secretManager, time.Now()); err != nil {
+		return nil, err
+	}
+
 	tlsSettings, err := cfg.TLSConfig.roundTripperSettings(opts.secretManager)
 	if err != nil {
 		return nil, err
@@ -758,7 +765,11 @@ func NewRoundTripperFromConfigWithContext(ctx context.Context, cfg HTTPClientCon
 		// No need for a RoundTripper that reloads the files automatically.
 		return newRT(tlsConfig)
 	}
-	return NewTLSRoundTripperWithContext(ctx, tlsConfig, tlsSettings, newRT)
+	tlsRT, err := newTLSRoundTripperWithContext(ctx, &cfg.TLSConfig, opts.secretManager, tlsConfig, tlsSettings, newRT)
+	if err != nil {
+		return nil, err
+	}
+	return tlsRT, nil
 }
 
 // SecretManager manages secret data mapped to names known as "references" or "refs".
@@ -1478,6 +1489,12 @@ func updateRootCA(cfg *tls.Config, b []byte) bool {
 // configuration whenever the content of the CA file changes.
 type tlsRoundTripper struct {
 	settings TLSRoundTripperSettings
+	// cfg is used to re-validate and re-pair rotating client cert/key material.
+	cfg *TLSConfig
+	// secretManager backs ref-based secrets when re-validating material.
+	secretManager SecretManager
+	// nowFunc is the clock used for certificate lifetime checks on rotations.
+	nowFunc func() time.Time
 
 	// newRT returns a new RoundTripper.
 	newRT func(*tls.Config) (http.RoundTripper, error)
@@ -1514,10 +1531,24 @@ func NewTLSRoundTripperWithContext(
 	settings TLSRoundTripperSettings,
 	newRT func(*tls.Config) (http.RoundTripper, error),
 ) (http.RoundTripper, error) {
+	return newTLSRoundTripperWithContext(ctx, nil, nil, cfg, settings, newRT)
+}
+
+func newTLSRoundTripperWithContext(
+	ctx context.Context,
+	tlsCfg *TLSConfig,
+	secretManager SecretManager,
+	cfg *tls.Config,
+	settings TLSRoundTripperSettings,
+	newRT func(*tls.Config) (http.RoundTripper, error),
+) (*tlsRoundTripper, error) {
 	t := &tlsRoundTripper{
-		settings:  settings,
-		newRT:     newRT,
-		tlsConfig: cfg,
+		settings:      settings,
+		cfg:           tlsCfg,
+		secretManager: secretManager,
+		nowFunc:       time.Now,
+		newRT:         newRT,
+		tlsConfig:     cfg,
 	}
 
 	rt, err := t.newRT(t.tlsConfig)
@@ -1575,10 +1606,79 @@ func (t *tlsRoundTripper) getTLSDataWithHash(ctx context.Context) ([]byte, []byt
 	return caBytes, caHash[:], certHash[:], keyHash[:], nil
 }
 
+// validateMaterials verifies rotated TLS material before it is installed:
+// the CA must parse as PEM and contain currently-valid certificates, and the
+// client cert/key pair must load and be within its validity window.
+func (t *tlsRoundTripper) validateMaterials(ctx context.Context, caData []byte) error {
+	now := t.nowFunc()
+
+	if t.settings.CA != nil {
+		var root tls.Config
+		if !updateRootCA(&root, caData) {
+			return fmt.Errorf("unable to use specified CA cert %s", t.settings.CA.Description())
+		}
+		if err := verifyCertificateLifetime(caData, now); err != nil {
+			return fmt.Errorf("CA cert %s: %w", t.settings.CA.Description(), err)
+		}
+	}
+
+	if t.settings.Cert == nil && t.settings.Key == nil {
+		return nil
+	}
+
+	var certData, keyData []byte
+	if t.settings.Cert != nil {
+		cert, err := t.settings.Cert.Fetch(ctx)
+		if err != nil {
+			return fmt.Errorf("unable to read client cert: %w", err)
+		}
+		certData = []byte(cert)
+	}
+	if t.settings.Key != nil {
+		key, err := t.settings.Key.Fetch(ctx)
+		if err != nil {
+			return fmt.Errorf("unable to read client key: %w", err)
+		}
+		keyData = []byte(key)
+	}
+
+	// When the originating TLSConfig is available, go through the same
+	// cert/key loading path as the initial client build so error messages and
+	// ref-based secrets behave identically. Otherwise pair the raw bytes
+	// directly.
+	var pair tls.Certificate
+	if t.cfg != nil {
+		clientCert, err := t.cfg.getClientCertificate(ctx, t.secretManager)
+		if err != nil {
+			return err
+		}
+		pair = *clientCert
+	} else {
+		var err error
+		pair, err = tls.X509KeyPair(certData, keyData)
+		if err != nil {
+			return err
+		}
+	}
+
+	for _, der := range pair.Certificate {
+		parsed, err := x509.ParseCertificate(der)
+		if err != nil {
+			return fmt.Errorf("unable to parse client certificate: %w", err)
+		}
+		if now.Before(parsed.NotBefore) || now.After(parsed.NotAfter) {
+			return fmt.Errorf("client certificate: %w: notBefore=%s notAfter=%s", ErrExpiredCertificate, parsed.NotBefore.UTC(), parsed.NotAfter.UTC())
+		}
+	}
+	return nil
+}
+
 // RoundTrip implements the http.RoundTrip interface.
 func (t *tlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	caData, caHash, certHash, keyHash, err := t.getTLSDataWithHash(req.Context())
 	if err != nil {
+		// The material cannot be read. Keep serving with the last known good
+		// RoundTripper instead of tearing down the working configuration.
 		return nil, err
 	}
 
@@ -1593,6 +1693,13 @@ func (t *tlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 		return rt.RoundTrip(req)
 	}
 
+	// Validate the new material before touching the active RoundTripper: a
+	// malformed or expired rotation must not replace the last known good
+	// configuration.
+	if err := t.validateMaterials(req.Context(), caData); err != nil {
+		return nil, err
+	}
+
 	// Create a new RoundTripper.
 	// The cert and key files are read separately by the client
 	// using GetClientCertificate.
@@ -1600,20 +1707,27 @@ func (t *tlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	if t.settings.CA != nil && !updateRootCA(tlsConfig, caData) {
 		return nil, fmt.Errorf("unable to use specified CA cert %s", t.settings.CA.Description())
 	}
-	rt, err = t.newRT(tlsConfig)
+	newRT, err := t.newRT(tlsConfig)
 	if err != nil {
+		// Building the transport failed; the previous RoundTripper stays in use.
 		return nil, err
 	}
-	t.CloseIdleConnections()
 
 	t.mtx.Lock()
-	t.rt = rt
+	oldRT := t.rt
+	t.rt = newRT
 	t.hashCAData = caHash
 	t.hashCertData = certHash
 	t.hashKeyData = keyHash
 	t.mtx.Unlock()
 
-	return rt.RoundTrip(req)
+	// Release the old transport's idle connections and their file handles now
+	// that it can no longer be selected.
+	if ci, ok := oldRT.(closeIdler); ok {
+		ci.CloseIdleConnections()
+	}
+
+	return newRT.RoundTrip(req)
 }
 
 func (t *tlsRoundTripper) CloseIdleConnections() {
