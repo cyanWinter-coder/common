@@ -27,15 +27,22 @@ import (
 // match.
 type LabelSet map[LabelName]LabelValue
 
-// Validate checks whether all names and values in the label set
-// are valid.
+// Validate checks whether all names and values in the label set are valid.
+// Names are checked in sorted order so the reported label is deterministic.
 func (ls LabelSet) Validate() error {
-	for ln, lv := range ls {
-		if !ln.IsValid() {
-			return fmt.Errorf("invalid name %q", ln)
+	names := make(LabelNames, 0, len(ls))
+	for ln := range ls {
+		names = append(names, ln)
+	}
+	sort.Sort(names)
+
+	for _, ln := range names {
+		lv := ls[ln]
+		if err := ValidateLabelName(ln); err != nil {
+			return err
 		}
 		if !lv.IsValid() {
-			return fmt.Errorf("invalid value %q", lv)
+			return &InvalidLabelError{Name: ln, Value: lv, Field: "value"}
 		}
 	}
 	return nil
@@ -156,10 +163,14 @@ func (ls *LabelSet) UnmarshalJSON(b []byte) error {
 	}
 	// encoding/json only unmarshals maps of the form map[string]T. It treats
 	// LabelName as a string and does not call its UnmarshalJSON method.
-	// Thus, we have to replicate the behavior here.
-	for ln := range m {
-		if !ln.IsValid() {
+	// Thus, we have to replicate the behavior here. Null values decode as the
+	// zero LabelValue, which is the canonical empty label value.
+	for ln, lv := range m {
+		if ValidateLabelName(ln) != nil {
 			return fmt.Errorf("%q is not a valid label name", ln)
+		}
+		if !lv.IsValid() {
+			return &InvalidLabelError{Name: ln, Value: lv, Field: "value"}
 		}
 	}
 	*ls = LabelSet(m)
